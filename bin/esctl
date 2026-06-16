@@ -1,0 +1,818 @@
+#!/usr/bin/env bash
+# esctl — Elasticsearch Cluster Manager
+# https://github.com/prvn-codes/esctl
+
+set -euo pipefail
+
+# ─── Version ─────────────────────────────────────────────────────────────────
+VERSION="1.0.0"
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+ESCTL_CONFIG="${ESCTL_CONFIG:-$HOME/.esctl/clusters.json}"
+ESCTL_CONFIG_DIR="$(dirname "$ESCTL_CONFIG")"
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ─── Output Helpers ──────────────────────────────────────────────────────────
+info()    { echo -e "${BLUE}$*${NC}"; }
+success() { echo -e "${GREEN}✅ $*${NC}"; }
+warn()    { echo -e "${YELLOW}⚠️  $*${NC}"; }
+error()   { echo -e "${RED}❌ $*${NC}" >&2; }
+die()     { error "$*"; exit 1; }
+
+banner() {
+    echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BLUE}${BOLD}  $*${NC}"
+    echo -e "${BLUE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo
+}
+
+expand_path() { echo "${1/\$HOME/$HOME}"; }
+
+# ─── Dependency Management ───────────────────────────────────────────────────
+check_deps() {
+    local missing=()
+
+    command -v jq   >/dev/null 2>&1 || missing+=("jq")
+    command -v curl >/dev/null 2>&1 || missing+=("curl")
+
+    [[ ${#missing[@]} -eq 0 ]] && return 0
+
+    warn "Missing required tools: ${missing[*]}"
+
+    if command -v brew >/dev/null 2>&1; then
+        read -rp "$(echo -e "${BLUE}Install via Homebrew now? ${YELLOW}[Y/n]${NC}: ")" confirm
+        confirm="${confirm:-Y}"
+        if [[ "${confirm^^}" == "Y" ]]; then
+            brew install "${missing[@]}"
+            success "Dependencies installed"
+            return 0
+        fi
+    fi
+
+    die "Please install missing tools and try again: ${missing[*]}"
+}
+
+# ─── ES Binary Detection ─────────────────────────────────────────────────────
+detect_es_bin() {
+    # 1. Explicit env override
+    if [[ -n "${ESCTL_ES_BIN:-}" ]]; then
+        if [[ -x "$ESCTL_ES_BIN" ]]; then
+            echo "$ESCTL_ES_BIN"; return 0
+        else
+            warn "ESCTL_ES_BIN is set but not executable: $ESCTL_ES_BIN"
+        fi
+    fi
+
+    # 2. evm installations — pick the latest
+    if [[ -d "$HOME/.evm" ]]; then
+        local latest
+        latest=$(find "$HOME/.evm" -name "elasticsearch" -path "*/bin/elasticsearch" 2>/dev/null \
+                 | sort -V | tail -1)
+        if [[ -n "$latest" && -x "$latest" ]]; then
+            echo "$latest"; return 0
+        fi
+    fi
+
+    # 3. PATH
+    if command -v elasticsearch >/dev/null 2>&1; then
+        command -v elasticsearch; return 0
+    fi
+
+    # 4. Common install locations
+    local paths=(
+        "/usr/local/bin/elasticsearch"
+        "/opt/homebrew/bin/elasticsearch"
+        "/usr/share/elasticsearch/bin/elasticsearch"
+        "/opt/elasticsearch/bin/elasticsearch"
+    )
+    for p in "${paths[@]}"; do
+        [[ -x "$p" ]] && echo "$p" && return 0
+    done
+
+    return 1
+}
+
+resolve_es_bin() {
+    local cluster_bin="${1:-}"
+
+    if [[ -n "$cluster_bin" && "$cluster_bin" != "null" ]]; then
+        local expanded
+        expanded=$(expand_path "$cluster_bin")
+        [[ -x "$expanded" ]] && echo "$expanded" && return 0
+        warn "Cluster-level ES binary not found: $expanded — falling back to auto-detect"
+    fi
+
+    local bin
+    bin=$(detect_es_bin 2>/dev/null) \
+        || die "Elasticsearch binary not found. Set ESCTL_ES_BIN or install via evm."
+    echo "$bin"
+}
+
+# ─── Config Management ───────────────────────────────────────────────────────
+init_config() {
+    if [[ ! -f "$ESCTL_CONFIG" ]]; then
+        mkdir -p "$ESCTL_CONFIG_DIR"
+        printf '{"version":"1","clusters":[]}\n' | jq '.' > "$ESCTL_CONFIG"
+    fi
+}
+
+load_config() {
+    init_config
+    cat "$ESCTL_CONFIG"
+}
+
+save_config() {
+    local tmp="${ESCTL_CONFIG}.tmp"
+    echo "$1" | jq '.' > "$tmp" && mv "$tmp" "$ESCTL_CONFIG"
+}
+
+get_cluster() {
+    load_config | jq -e --arg n "$1" '.clusters[] | select(.name == $n)'
+}
+
+cluster_exists() {
+    get_cluster "$1" >/dev/null 2>&1
+}
+
+all_cluster_names() {
+    load_config | jq -r '.clusters[].name'
+}
+
+next_port() {
+    local max
+    max=$(load_config | jq '[.clusters[].port] | if length == 0 then 9199 else max end')
+    echo $((max + 1))
+}
+
+# ─── Process Helpers ─────────────────────────────────────────────────────────
+find_pid() {
+    local name="$1"
+    local pid=""
+
+    # pgrep — take only the first match to guard against multiple results
+    pid=$(pgrep -f "cluster\.name=${name}" 2>/dev/null | head -1 || true)
+    [[ -n "$pid" ]] && echo "$pid" && return 0
+
+    # ps fallback
+    pid=$(ps aux 2>/dev/null \
+          | grep "[j]ava.*cluster\.name=${name}" \
+          | awk '{print $2}' | head -1 || true)
+    [[ -n "$pid" ]] && echo "$pid" && return 0
+
+    # Port-based lookup — only trust if the command line actually matches
+    local port
+    port=$(load_config | jq -r --arg n "$name" \
+           '.clusters[] | select(.name == $n) | .port // empty' 2>/dev/null || true)
+    if [[ -n "$port" ]]; then
+        local port_pid
+        port_pid=$(lsof -ti ":${port}" 2>/dev/null | head -1 || true)
+        if [[ -n "$port_pid" ]]; then
+            local cmd_line
+            cmd_line=$(ps -p "$port_pid" -ww -o command= 2>/dev/null || true)
+            if echo "$cmd_line" | grep -qE "cluster\.name=${name}"; then
+                echo "$port_pid"; return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+is_running() {
+    local pid
+    pid=$(find_pid "$1" 2>/dev/null) || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+is_port_in_use() {
+    lsof -i ":$1" >/dev/null 2>&1
+}
+
+wait_for_http() {
+    local port="$1" max="${2:-60}" elapsed=0
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn "curl not available — skipping HTTP readiness check, waiting 5s"
+        sleep 5; return 0
+    fi
+
+    while (( elapsed < max )); do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:${port}" 2>/dev/null || true)
+        [[ "$code" == "200" ]] && return 0
+        sleep 2; elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+get_uptime() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null || { echo "N/A"; return; }
+
+    if [[ "$OSTYPE" == darwin* ]]; then
+        ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo "N/A"
+    else
+        local start secs
+        start=$(stat -c %Y "/proc/$pid" 2>/dev/null) || { echo "N/A"; return; }
+        secs=$(( $(date +%s) - start ))
+        if   (( secs < 60 ));    then echo "${secs}s"
+        elif (( secs < 3600 ));  then echo "$((secs / 60))m"
+        elif (( secs < 86400 )); then echo "$((secs / 3600))h"
+        else echo "$((secs / 86400))d"
+        fi
+    fi
+}
+
+get_memory() {
+    local pid="$1"
+    kill -0 "$pid" 2>/dev/null || { echo "N/A"; return; }
+
+    local kb
+    if [[ "$OSTYPE" == darwin* ]]; then
+        kb=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ') || { echo "N/A"; return; }
+    else
+        kb=$(grep VmRSS "/proc/$pid/status" 2>/dev/null | awk '{print $2}') || { echo "N/A"; return; }
+    fi
+
+    if   (( kb < 1024 ));    then echo "${kb}KB"
+    elif (( kb < 1048576 )); then echo "$((kb / 1024))MB"
+    else echo "$((kb / 1024 / 1024))GB"
+    fi
+}
+
+# ─── Cluster Operations ──────────────────────────────────────────────────────
+_start_one() {
+    local name="$1"
+    local cfg
+    cfg=$(get_cluster "$name")
+
+    local node_name port data_dir logs_dir es_bin
+    node_name=$(echo "$cfg" | jq -r '.node_name')
+    port=$(echo "$cfg"      | jq -r '.port')
+    data_dir=$(expand_path  "$(echo "$cfg" | jq -r '.data_dir')")
+    logs_dir=$(expand_path  "$(echo "$cfg" | jq -r '.logs_dir')")
+    es_bin=$(resolve_es_bin "$(echo "$cfg" | jq -r '.es_bin // empty')")
+
+    if is_running "$name"; then
+        warn "$name is already running"; return 0
+    fi
+
+    if is_port_in_use "$port"; then
+        error "Port $port is already in use"; return 1
+    fi
+
+    mkdir -p "$data_dir" "$logs_dir"
+
+    info "Starting $name on port $port..."
+    "$es_bin" \
+        -Ecluster.name="$name" \
+        -Enode.name="$node_name" \
+        -Epath.data="$data_dir" \
+        -Epath.logs="$logs_dir" \
+        -Ehttp.port="$port" \
+        -Ediscovery.type=single-node \
+        -Expack.security.enabled=false \
+        -d
+
+    if wait_for_http "$port" 60; then
+        success "$name started (port $port)"
+    else
+        error "$name did not respond within 60s — check logs at $logs_dir"
+        return 1
+    fi
+}
+
+_stop_one() {
+    local name="$1"
+
+    if ! is_running "$name"; then
+        warn "$name is not running"; return 0
+    fi
+
+    local pid
+    pid=$(find_pid "$name")
+
+    local port="N/A"
+    cluster_exists "$name" && port=$(get_cluster "$name" | jq -r '.port')
+
+    info "Stopping $name (PID: $pid, Port: $port)..."
+    kill "$pid" 2>/dev/null || true
+
+    local count=0
+    while is_running "$name" && (( count < 30 )); do
+        sleep 1; count=$((count + 1))
+    done
+
+    if is_running "$name"; then
+        warn "Graceful stop timed out — force killing..."
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+    fi
+
+    if ! is_running "$name"; then
+        success "$name stopped"
+    else
+        error "Failed to stop $name"; return 1
+    fi
+}
+
+# ─── Commands ────────────────────────────────────────────────────────────────
+cmd_start() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        banner "Starting All Clusters"
+        local names total=0 failed=0
+        names=$(all_cluster_names)
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            total=$((total + 1))
+            _start_one "$n" || failed=$((failed + 1))
+            echo
+        done <<< "$names"
+        cmd_list
+        (( total > 0 && failed == total )) && return 1; return 0
+    fi
+
+    cluster_exists "$name" \
+        || die "Cluster '$name' not found. Run 'esctl list' to see available clusters."
+    _start_one "$name"
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        banner "Stopping All Clusters"
+        local names
+        names=$(all_cluster_names)
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            _stop_one "$n" || true; echo
+        done <<< "$names"
+        cmd_list; return 0
+    fi
+    _stop_one "$name"
+}
+
+cmd_restart() {
+    local name="${1:-}"
+    banner "Restarting ${name:-All Clusters}"
+
+    if [[ -z "$name" || "$name" == "all" ]]; then
+        local names
+        names=$(all_cluster_names)
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            is_running "$n" && _stop_one "$n"; echo
+        done <<< "$names"
+        sleep 2
+        while IFS= read -r n; do
+            [[ -z "$n" ]] && continue
+            _start_one "$n" || true; echo
+        done <<< "$names"
+        cmd_list
+    else
+        is_running "$name" && _stop_one "$name"
+        sleep 2
+        if cluster_exists "$name"; then
+            _start_one "$name"
+        else
+            warn "Cluster '$name' not in config — stopped but cannot restart"
+        fi
+    fi
+}
+
+cmd_status() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && { cmd_list; return; }
+
+    cluster_exists "$name" || die "Cluster '$name' not found"
+    local port
+    port=$(get_cluster "$name" | jq -r '.port')
+
+    if is_running "$name"; then
+        local pid http="N/A"
+        pid=$(find_pid "$name")
+        if command -v curl >/dev/null 2>&1; then
+            curl -s "http://localhost:$port" >/dev/null 2>&1 && http="OK" || http="Not responding"
+        fi
+        echo -e "${GREEN}●${NC} $name: ${GREEN}RUNNING${NC} (PID: $pid, Port: $port, HTTP: $http)"
+    else
+        echo -e "${RED}○${NC} $name: ${RED}STOPPED${NC} (Port: $port)"
+    fi
+}
+
+cmd_list() {
+    local names
+    names=$(all_cluster_names)
+
+    local count=0
+    while IFS= read -r n; do [[ -z "$n" ]] && continue; count=$((count + 1)); done <<< "$names"
+
+    if (( count == 0 )); then
+        warn "No clusters configured. Run 'esctl add' to create one."; return 0
+    fi
+
+    local sep
+    sep=$(printf '─%.0s' {1..106})
+
+    printf "\n"
+    printf "%b%-22s %-22s %-8s %-10s %-12s %-12s %-12s %-10s%b\n" \
+        "${BOLD}" "CLUSTER" "NODE" "PORT" "STATUS" "PID" "UPTIME" "MEMORY" "HTTP" "${NC}"
+    printf "%b%s%b\n" "${BLUE}" "$sep" "${NC}"
+
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+
+        local cfg node_name port status_text status_color pid uptime memory http_text http_color
+        cfg=$(get_cluster "$name")
+        node_name=$(echo "$cfg" | jq -r '.node_name // "N/A"')
+        port=$(echo "$cfg"      | jq -r '.port // "N/A"')
+        status_text="STOPPED"; status_color="${RED}"
+        pid="N/A"; uptime="N/A"; memory="N/A"; http_text="N/A"; http_color=""
+
+        if is_running "$name"; then
+            status_text="RUNNING"; status_color="${GREEN}"
+            pid=$(find_pid "$name")
+            uptime=$(get_uptime "$pid")
+            memory=$(get_memory "$pid")
+            if command -v curl >/dev/null 2>&1; then
+                if curl -s "http://localhost:$port" >/dev/null 2>&1; then
+                    http_text="OK";    http_color="${GREEN}"
+                else
+                    http_text="ERROR"; http_color="${YELLOW}"
+                fi
+            fi
+        fi
+
+        printf "%-22s %-22s %-8s " "$name" "$node_name" "$port"
+        printf "%b%-10s%b " "$status_color" "$status_text" "${NC}"
+        printf "%-12s %-12s %-12s " "$pid" "$uptime" "$memory"
+        if [[ -n "$http_color" ]]; then
+            printf "%b%-10s%b\n" "$http_color" "$http_text" "${NC}"
+        else
+            printf "%-10s\n" "$http_text"
+        fi
+    done <<< "$names"
+
+    printf "%b%s%b\n\n" "${BLUE}" "$sep" "${NC}"
+
+    # Access URLs for running clusters
+    local any_running=false
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        is_running "$name" && { any_running=true; break; }
+    done <<< "$names"
+
+    if [[ "$any_running" == true ]]; then
+        echo -e "${BLUE}Access URLs:${NC}"
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            if is_running "$name"; then
+                local port
+                port=$(get_cluster "$name" | jq -r '.port')
+                echo "  • $name → http://localhost:$port"
+            fi
+        done <<< "$names"
+        echo
+    fi
+}
+
+cmd_add() {
+    banner "Add Elasticsearch Cluster"
+
+    # Cluster name
+    local name=""
+    while [[ -z "$name" ]]; do
+        read -rp "$(echo -e "${BLUE}Cluster name: ${NC}")" name
+        name="${name// /}"
+        if [[ -z "$name" ]]; then
+            error "Name cannot be empty"; continue
+        fi
+        if ! [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            error "Name can only contain letters, numbers, underscores, hyphens"
+            name=""; continue
+        fi
+        if cluster_exists "$name"; then
+            error "Cluster '$name' already exists"; name=""; continue
+        fi
+    done
+
+    # Node name
+    local default_node="node-${name}"
+    read -rp "$(echo -e "${BLUE}Node name ${YELLOW}[$default_node]${NC}: ")" node_name
+    node_name="${node_name:-$default_node}"
+    node_name="${node_name// /}"
+
+    # Port
+    local default_port
+    default_port=$(next_port)
+    local port=""
+    while [[ -z "$port" ]]; do
+        read -rp "$(echo -e "${BLUE}Port ${YELLOW}[$default_port]${NC}: ")" port
+        port="${port:-$default_port}"; port="${port// /}"
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+            error "Port must be between 1024 and 65535"; port=""; continue
+        fi
+        if is_port_in_use "$port"; then
+            error "Port $port is already in use"; port=""; continue
+        fi
+        local taken
+        taken=$(load_config | jq -r --argjson p "$port" \
+                '.clusters[] | select(.port == $p) | .name' 2>/dev/null || true)
+        if [[ -n "$taken" ]]; then
+            error "Port $port is already assigned to cluster '$taken'"; port=""; continue
+        fi
+    done
+
+    # ES binary
+    local detected_bin=""
+    detected_bin=$(detect_es_bin 2>/dev/null || true)
+    local bin_label="${detected_bin:-not found — set ESCTL_ES_BIN}"
+    read -rp "$(echo -e "${BLUE}Elasticsearch binary ${YELLOW}[$bin_label]${NC}: ")" es_bin
+    es_bin="${es_bin:-}"
+    if [[ -n "$es_bin" && ! -x "$es_bin" ]]; then
+        warn "Binary not found or not executable at: $es_bin"
+    fi
+
+    # Directories
+    local default_data="$HOME/.esctl/data/${name}"
+    local default_logs="$HOME/.esctl/logs/${name}"
+
+    read -rp "$(echo -e "${BLUE}Data directory ${YELLOW}[$default_data]${NC}: ")" data_dir
+    data_dir=$(expand_path "${data_dir:-$default_data}")
+
+    read -rp "$(echo -e "${BLUE}Logs directory ${YELLOW}[$default_logs]${NC}: ")" logs_dir
+    logs_dir=$(expand_path "${logs_dir:-$default_logs}")
+
+    echo
+    echo -e "${BOLD}Summary:${NC}"
+    echo "  Cluster : $name"
+    echo "  Node    : $node_name"
+    echo "  Port    : $port"
+    echo "  ES bin  : ${es_bin:-auto-detect}"
+    echo "  Data    : $data_dir"
+    echo "  Logs    : $logs_dir"
+    echo
+
+    read -rp "$(echo -e "${BLUE}Add cluster? ${YELLOW}[Y/n]${NC}: ")" confirm
+    [[ "${confirm:-Y}" =~ ^[Yy] ]] || { warn "Cancelled"; return 1; }
+
+    local nd nl new_entry config
+    nd="${data_dir/$HOME/\$HOME}"
+    nl="${logs_dir/$HOME/\$HOME}"
+
+    new_entry=$(jq -n \
+        --arg  name      "$name"      \
+        --arg  node_name "$node_name" \
+        --argjson port   "$port"      \
+        --arg  data_dir  "$nd"        \
+        --arg  logs_dir  "$nl"        \
+        --arg  es_bin    "$es_bin"    \
+        '{
+            name:      $name,
+            node_name: $node_name,
+            port:      $port,
+            data_dir:  $data_dir,
+            logs_dir:  $logs_dir,
+            es_bin:    (if $es_bin == "" then null else $es_bin end)
+        }')
+
+    config=$(load_config | jq --argjson c "$new_entry" '.clusters += [$c]')
+    save_config "$config"
+    mkdir -p "$data_dir" "$logs_dir"
+    success "Cluster '$name' added"
+
+    read -rp "$(echo -e "${BLUE}Start it now? ${YELLOW}[y/N]${NC}: ")" start_now
+    [[ "${start_now:-N}" =~ ^[Yy] ]] && _start_one "$name"
+}
+
+cmd_edit() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: esctl edit <cluster>"
+    cluster_exists "$name" || die "Cluster '$name' not found"
+
+    banner "Edit Cluster: $name"
+
+    if is_running "$name"; then
+        warn "Cluster '$name' is currently running"
+        read -rp "$(echo -e "${YELLOW}Stop it before editing? ${NC}[y/N]: ")" stop_now
+        [[ "${stop_now:-N}" =~ ^[Yy] ]] && _stop_one "$name" \
+            || die "Please stop the cluster before editing"
+    fi
+
+    local cfg
+    cfg=$(get_cluster "$name")
+    local cur_node cur_port cur_data cur_logs cur_es_bin
+    cur_node=$(echo "$cfg"   | jq -r '.node_name')
+    cur_port=$(echo "$cfg"   | jq -r '.port')
+    cur_data=$(expand_path   "$(echo "$cfg" | jq -r '.data_dir')")
+    cur_logs=$(expand_path   "$(echo "$cfg" | jq -r '.logs_dir')")
+    cur_es_bin=$(echo "$cfg" | jq -r '.es_bin // ""')
+
+    echo -e "${YELLOW}Press enter to keep the current value shown in brackets${NC}\n"
+
+    read -rp "$(echo -e "${BLUE}Node name ${YELLOW}[$cur_node]${NC}: ")" node_name
+    node_name="${node_name:-$cur_node}"
+
+    local port=""
+    while [[ -z "$port" ]]; do
+        read -rp "$(echo -e "${BLUE}Port ${YELLOW}[$cur_port]${NC}: ")" port
+        port="${port:-$cur_port}"
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1024 || port > 65535 )); then
+            error "Port must be between 1024 and 65535"; port=""; continue
+        fi
+        if [[ "$port" != "$cur_port" ]] && is_port_in_use "$port"; then
+            error "Port $port is already in use"; port=""; continue
+        fi
+    done
+
+    read -rp "$(echo -e "${BLUE}ES binary ${YELLOW}[${cur_es_bin:-auto-detect}]${NC}: ")" es_bin
+    es_bin="${es_bin:-$cur_es_bin}"
+
+    read -rp "$(echo -e "${BLUE}Data directory ${YELLOW}[$cur_data]${NC}: ")" data_dir
+    data_dir=$(expand_path "${data_dir:-$cur_data}")
+
+    read -rp "$(echo -e "${BLUE}Logs directory ${YELLOW}[$cur_logs]${NC}: ")" logs_dir
+    logs_dir=$(expand_path "${logs_dir:-$cur_logs}")
+
+    echo
+    echo -e "${BOLD}Updated values:${NC}"
+    echo "  Node    : $node_name"
+    echo "  Port    : $port"
+    echo "  ES bin  : ${es_bin:-auto-detect}"
+    echo "  Data    : $data_dir"
+    echo "  Logs    : $logs_dir"
+    echo
+
+    read -rp "$(echo -e "${BLUE}Save changes? ${YELLOW}[Y/n]${NC}: ")" confirm
+    [[ "${confirm:-Y}" =~ ^[Yy] ]] || { warn "Cancelled"; return 0; }
+
+    local nd nl config
+    nd="${data_dir/$HOME/\$HOME}"
+    nl="${logs_dir/$HOME/\$HOME}"
+
+    config=$(load_config | jq \
+        --arg  n        "$name"      \
+        --arg  node     "$node_name" \
+        --argjson port  "$port"      \
+        --arg  data_dir "$nd"        \
+        --arg  logs_dir "$nl"        \
+        --arg  es_bin   "$es_bin"    \
+        '(.clusters[] | select(.name == $n)) |= . + {
+            node_name: $node,
+            port:      $port,
+            data_dir:  $data_dir,
+            logs_dir:  $logs_dir,
+            es_bin:    (if $es_bin == "" then null else $es_bin end)
+        }')
+    save_config "$config"
+    mkdir -p "$data_dir" "$logs_dir"
+    success "Cluster '$name' updated"
+}
+
+cmd_remove() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: esctl remove <cluster>"
+    cluster_exists "$name" || die "Cluster '$name' not found"
+
+    if is_running "$name"; then
+        warn "Cluster '$name' is currently running"
+        read -rp "$(echo -e "${YELLOW}Stop and remove? ${NC}[y/N]: ")" confirm
+        [[ "${confirm:-N}" =~ ^[Yy] ]] && _stop_one "$name" \
+            || die "Cannot remove a running cluster"
+    fi
+
+    local cfg data_dir logs_dir
+    cfg=$(get_cluster "$name")
+    data_dir=$(expand_path "$(echo "$cfg" | jq -r '.data_dir')")
+    logs_dir=$(expand_path "$(echo "$cfg" | jq -r '.logs_dir')")
+
+    read -rp "$(echo -e "${YELLOW}Also delete data and logs directories? ${NC}[y/N]: ")" del_data
+
+    local config
+    config=$(load_config | jq --arg n "$name" 'del(.clusters[] | select(.name == $n))')
+    save_config "$config"
+
+    if [[ "${del_data:-N}" =~ ^[Yy] ]]; then
+        [[ -d "$data_dir" ]] && rm -rf "$data_dir" && success "Deleted: $data_dir"
+        [[ -d "$logs_dir" ]] && rm -rf "$logs_dir" && success "Deleted: $logs_dir"
+    fi
+
+    success "Cluster '$name' removed"
+}
+
+cmd_doctor() {
+    banner "esctl Doctor"
+
+    if command -v jq >/dev/null 2>&1; then
+        echo -e "${GREEN}✅${NC} jq      : $(jq --version)"
+    else
+        echo -e "${RED}❌${NC} jq      : not found  →  brew install jq"
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        echo -e "${GREEN}✅${NC} curl    : $(curl --version | head -1)"
+    else
+        echo -e "${YELLOW}⚠️ ${NC} curl    : not found (HTTP readiness checks will be skipped)"
+    fi
+
+    local bin
+    if bin=$(detect_es_bin 2>/dev/null); then
+        echo -e "${GREEN}✅${NC} esbin   : $bin"
+    else
+        echo -e "${RED}❌${NC} esbin   : not found"
+        echo -e "           Set ${CYAN}ESCTL_ES_BIN${NC} or install via evm"
+    fi
+
+    if [[ -f "$ESCTL_CONFIG" ]]; then
+        local count
+        count=$(jq '.clusters | length' "$ESCTL_CONFIG")
+        echo -e "${GREEN}✅${NC} config  : $ESCTL_CONFIG ($count cluster(s))"
+    else
+        echo -e "${YELLOW}⚠️ ${NC} config  : not yet created (created on first use)"
+    fi
+
+    echo
+}
+
+cmd_config() {
+    echo -e "${BLUE}Config file:${NC} $ESCTL_CONFIG\n"
+    load_config | jq '.'
+}
+
+usage() {
+    cat << EOF
+
+${BOLD}esctl${NC} v${VERSION} — Elasticsearch Cluster Manager
+
+${BOLD}USAGE${NC}
+  esctl <command> [cluster]
+
+${BOLD}COMMANDS${NC}
+  ${GREEN}start${NC}   [cluster]    Start a cluster (or all if omitted)
+  ${GREEN}stop${NC}    [cluster]    Stop a cluster (or all if omitted)
+  ${GREEN}restart${NC} [cluster]    Restart a cluster (or all if omitted)
+  ${GREEN}status${NC}  [cluster]    Show cluster status (or list if omitted)
+  ${GREEN}list${NC}                 List all clusters with live status
+  ${GREEN}add${NC}                  Add a new cluster (interactive)
+  ${GREEN}edit${NC}    <cluster>    Edit a cluster's configuration
+  ${GREEN}remove${NC}  <cluster>    Remove a cluster
+  ${GREEN}doctor${NC}               Check dependencies and configuration
+  ${GREEN}config${NC}               Show config file path and contents
+  ${GREEN}version${NC}              Show esctl version
+
+${BOLD}ENVIRONMENT${NC}
+  ${CYAN}ESCTL_ES_BIN${NC}    Path to elasticsearch binary (overrides auto-detect)
+  ${CYAN}ESCTL_CONFIG${NC}    Config file path (default: ~/.esctl/clusters.json)
+
+${BOLD}AUTO-DETECT ORDER${NC}
+  1. \$ESCTL_ES_BIN env var
+  2. evm installations in ~/.evm (latest version picked automatically)
+  3. elasticsearch on \$PATH
+  4. Common install paths (/usr/local/bin, /opt/homebrew/bin, etc.)
+
+${BOLD}EXAMPLES${NC}
+  esctl add                   Create a new cluster
+  esctl start                 Start all clusters
+  esctl start myapp           Start only 'myapp'
+  esctl list                  Show all clusters and their live status
+  esctl edit myapp            Edit 'myapp' configuration
+  esctl stop myapp            Stop 'myapp'
+  esctl remove myapp          Remove 'myapp'
+  esctl doctor                Check your setup
+
+EOF
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        start)          check_deps; cmd_start   "$@" ;;
+        stop)                       cmd_stop    "$@" ;;
+        restart)        check_deps; cmd_restart "$@" ;;
+        status)                     cmd_status  "$@" ;;
+        list)                       cmd_list         ;;
+        add)            check_deps; cmd_add          ;;
+        edit)                       cmd_edit    "$@" ;;
+        remove)                     cmd_remove  "$@" ;;
+        doctor)                     cmd_doctor       ;;
+        config)                     cmd_config       ;;
+        version)        echo "esctl v${VERSION}"     ;;
+        help|--help|-h) usage                        ;;
+        "")             usage; exit 1                ;;
+        *)              error "Unknown command: $cmd"; echo; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
