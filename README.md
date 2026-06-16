@@ -101,14 +101,11 @@ esctl stop
 ### Live status table
 
 ```
-CLUSTER                NODE                   PORT     STATUS     PID          UPTIME       MEMORY       HTTP
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-myapp                  node-myapp             9200     RUNNING    81234        12:04        1GB          OK
-staging                node-staging           9201     STOPPED    N/A          N/A          N/A          N/A
-──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-
-Access URLs:
-  • myapp → http://localhost:9200
+CLUSTER                NODE                   PORT     STATUS     UPTIME       MEMORY       HTTP     ACCESS URL
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+myapp                  node-myapp             9200     RUNNING    12:04        1GB          OK       http://localhost:9200
+staging                node-staging           9201     STOPPED    N/A          N/A          N/A      —
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ```
 
 ---
