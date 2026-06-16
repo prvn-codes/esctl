@@ -62,17 +62,20 @@ Works with [evm](https://github.com/duydo/evm), Homebrew, manual installs — an
 esctl <command> [cluster]
 
 COMMANDS
-  start   [cluster]    Start a cluster (or all if omitted)
+  start   [cluster]    Start a cluster (or all if omitted); --verbose to stream logs
   stop    [cluster]    Stop a cluster (or all if omitted)
-  restart [cluster]    Restart a cluster (or all if omitted)
+  restart [cluster]    Restart a cluster (or all if omitted); --verbose to stream logs
   status  [cluster]    Show cluster status
   list                 List all clusters with live status
   add                  Add a new cluster (interactive)
   edit    <cluster>    Edit a cluster's configuration
   remove  <cluster>    Remove a cluster
+  logs    <cluster>    Tail cluster logs (-f to follow)
+  setup                Configure environment interactively
+  import               Detect and import running clusters
   doctor               Check dependencies and configuration
   config               Show config file path and contents
-  version              Show esctl version
+  version              Show version
 ```
 
 ### Examples
@@ -88,8 +91,15 @@ esctl add
 # Start it
 esctl start myapp
 
+# Start with live log output
+esctl start myapp --verbose
+
 # See all clusters and their live status
 esctl list
+
+# Tail logs for a running cluster
+esctl logs myapp
+esctl logs -f myapp        # follow in real time
 
 # Edit a cluster's config
 esctl edit myapp
