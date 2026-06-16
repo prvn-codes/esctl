@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ─── Version ─────────────────────────────────────────────────────────────────
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 ESCTL_CONFIG="${ESCTL_CONFIG:-$HOME/.esctl/clusters.json}"
