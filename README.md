@@ -14,19 +14,22 @@ esctl stop myapp
 
 ## Install
 
-### Homebrew (recommended)
-
-```bash
-brew tap prvn-codes/tap
-brew install esctl
-```
-
-### Manual
+### curl (recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/prvn-codes/esctl/main/bin/esctl \
   -o /usr/local/bin/esctl && chmod +x /usr/local/bin/esctl
 ```
+
+### Homebrew
+
+```bash
+brew tap prvn-codes/tap
+brew trust prvn-codes/tap   # required for third-party taps
+brew install esctl
+```
+
+> Homebrew requires trusting third-party taps before installing. This is a one-time step.
 
 ---
 
