@@ -10,6 +10,9 @@ VERSION="1.0.2"
 # ─── Config ──────────────────────────────────────────────────────────────────
 ESCTL_CONFIG="${ESCTL_CONFIG:-$HOME/.esctl/clusters.json}"
 ESCTL_CONFIG_DIR="$(dirname "$ESCTL_CONFIG")"
+ESCTL_SETTINGS_FILE="$HOME/.esctl/es-settings"
+DEFAULT_HEAP="1g"
+CORS_ALLOWED_HEADERS="X-Requested-With,Content-Type,Content-Length,Authorization"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -262,6 +265,150 @@ get_memory() {
     fi
 }
 
+# ─── Advanced ES Settings ────────────────────────────────────────────────────
+# One file for all clusters. Lines starting with "-" are JVM options
+# (sent via ES_JAVA_OPTS); every other line is an ES setting (sent as -E).
+
+# Lines the guided prompts own; everything else in the file is kept as-is.
+MANAGED_SETTINGS_PATTERN='^[[:space:]]*(#|-Xm[sx]|cluster\.routing\.allocation\.disk\.threshold_enabled=|xpack\.ml\.enabled=|http\.cors\.)'
+
+trim() {
+    local text="$1"
+    text="${text#"${text%%[![:space:]]*}"}"
+    echo "${text%"${text##*[![:space:]]}"}"
+}
+
+read_setting() {
+    [[ -f "$ESCTL_SETTINGS_FILE" ]] || return 0
+    trim "$(sed -n "s/^[[:space:]]*$1=//p" "$ESCTL_SETTINGS_FILE" | tail -1)"
+}
+
+read_heap() {
+    [[ -f "$ESCTL_SETTINGS_FILE" ]] || return 0
+    trim "$(sed -n 's/^[[:space:]]*-Xmx//p' "$ESCTL_SETTINGS_FILE" | tail -1)"
+}
+
+write_settings_file() {
+    local heap="$1" ignore_disk="$2" disable_ml="$3" cors_origin="$4"
+    local custom_lines=""
+    if [[ -f "$ESCTL_SETTINGS_FILE" ]]; then
+        custom_lines=$(grep -vE "$MANAGED_SETTINGS_PATTERN" "$ESCTL_SETTINGS_FILE" | grep -v '^[[:space:]]*$' || true)
+    fi
+
+    mkdir -p "$(dirname "$ESCTL_SETTINGS_FILE")"
+    {
+        echo "# esctl advanced settings — applied to every cluster on start."
+        echo "# Lines starting with \"-\" are JVM options (passed via ES_JAVA_OPTS)."
+        echo "# Other lines are ES settings (passed as -E<key>=<value>)."
+        echo "# Values are read as YAML: quote ones like * (key=\"*\")."
+        echo "-Xms${heap}"
+        echo "-Xmx${heap}"
+        if [[ "$ignore_disk" == true ]]; then
+            echo "cluster.routing.allocation.disk.threshold_enabled=false"
+        fi
+        if [[ "$disable_ml" == true ]]; then
+            echo "xpack.ml.enabled=false"
+        fi
+        if [[ -n "$cors_origin" ]]; then
+            echo "http.cors.enabled=true"
+            # Quoted: ES parses -E values as YAML, where a bare * is invalid.
+            echo "http.cors.allow-origin=\"${cors_origin}\""
+            echo "http.cors.allow-headers=${CORS_ALLOWED_HEADERS}"
+        fi
+        if [[ -n "$custom_lines" ]]; then
+            echo "$custom_lines"
+        fi
+    } > "$ESCTL_SETTINGS_FILE"
+}
+
+# Returns 0 for yes. $2 is the default answer: Y or N.
+ask_yes_no() {
+    local question="$1" default_answer="$2" hint answer
+    if [[ "$default_answer" == Y ]]; then hint="Y/n"; else hint="y/N"; fi
+    read -rp "$(echo -e "${BLUE}${question} ${YELLOW}[$hint]${NC}: ")" answer
+    [[ "${answer:-$default_answer}" =~ ^[Yy] ]]
+}
+
+configure_settings_guided() {
+    echo -e "\n${BOLD}Advanced Settings (all clusters)${NC}"
+
+    local current_heap heap
+    current_heap=$(read_heap)
+    current_heap="${current_heap:-$DEFAULT_HEAP}"
+    while true; do
+        read -rp "$(echo -e "  ${BLUE}Heap size (e.g. 512m, 1g, 2g) ${YELLOW}[$current_heap]${NC}: ")" heap
+        heap="${heap:-$current_heap}"
+        [[ "$heap" =~ ^[1-9][0-9]*[mMgG]$ ]] && break
+        error "Use a number + m or g, like 1g"
+    done
+
+    local disk_default=Y ml_default=Y cors_default=N
+    if [[ -f "$ESCTL_SETTINGS_FILE" ]]; then
+        [[ "$(read_setting 'cluster\.routing\.allocation\.disk\.threshold_enabled')" == false ]] || disk_default=N
+        [[ "$(read_setting 'xpack\.ml\.enabled')" == false ]] || ml_default=N
+        [[ "$(read_setting 'http\.cors\.enabled')" != true ]] || cors_default=Y
+    fi
+
+    local ignore_disk=false disable_ml=false cors_origin=""
+    ask_yes_no "  Ignore disk-full checks? (stops indices going read-only)" "$disk_default" && ignore_disk=true
+    ask_yes_no "  Disable machine learning? (saves memory)" "$ml_default" && disable_ml=true
+    if ask_yes_no "  Allow browser tools like Elasticvue (CORS)?" "$cors_default"; then
+        local current_origin
+        current_origin=$(read_setting 'http\.cors\.allow-origin')
+        current_origin="${current_origin#\"}"
+        current_origin="${current_origin%\"}"
+        current_origin="${current_origin:-*}"
+        read -rp "$(echo -e "  ${BLUE}Allowed origin ${YELLOW}[$current_origin]${NC}: ")" cors_origin
+        cors_origin="${cors_origin:-$current_origin}"
+    fi
+
+    write_settings_file "$heap" "$ignore_disk" "$disable_ml" "$cors_origin"
+    success "Saved to $ESCTL_SETTINGS_FILE"
+}
+
+configure_settings_in_editor() {
+    if [[ ! -f "$ESCTL_SETTINGS_FILE" ]]; then
+        write_settings_file "$DEFAULT_HEAP" true true ""
+    fi
+    local editor="${VISUAL:-${EDITOR:-vi}}"
+    # Unquoted on purpose: the editor may include flags, e.g. "code -w".
+    # shellcheck disable=SC2086
+    if $editor "$ESCTL_SETTINGS_FILE"; then
+        success "Saved to $ESCTL_SETTINGS_FILE"
+    else
+        warn "Editor exited with an error — check $ESCTL_SETTINGS_FILE"
+    fi
+}
+
+configure_advanced_settings() {
+    ask_yes_no "Configure advanced ES settings?" N || return 0
+    echo "  1) Guided    — answer a few questions"
+    echo "  2) Edit file — open $ESCTL_SETTINGS_FILE in your editor"
+    local choice
+    read -rp "$(echo -e "${BLUE}Choose ${YELLOW}[1]${NC}: ")" choice
+    case "${choice:-1}" in
+        1) configure_settings_guided ;;
+        2) configure_settings_in_editor ;;
+        *) warn "Unknown choice '$choice' — skipping advanced settings"; return 0 ;;
+    esac
+    warn "Restart running clusters to apply: esctl restart"
+}
+
+# Fills the caller's jvm_options and es_settings arrays from the settings file.
+load_settings() {
+    [[ -f "$ESCTL_SETTINGS_FILE" ]] || return 0
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(trim "$line")
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if [[ "$line" == -* ]]; then
+            jvm_options+=("$line")
+        else
+            es_settings+=("-E$line")
+        fi
+    done < "$ESCTL_SETTINGS_FILE"
+}
+
 # ─── Cluster Operations ──────────────────────────────────────────────────────
 _start_one() {
     local name="$1" verbose="${2:-false}"
@@ -297,26 +444,32 @@ _start_one() {
         tail_pid=$!
     fi
 
+    local jvm_options=() es_settings=()
+    load_settings
+
+    local es_args=(
+        -Ecluster.name="$name"
+        -Enode.name="$node_name"
+        -Epath.data="$data_dir"
+        -Epath.logs="$logs_dir"
+        -Ehttp.port="$port"
+        -Ediscovery.type=single-node
+        -Expack.security.enabled=false
+        -d
+    )
+    # "${arr[@]+...}" keeps bash 3.2 happy with empty arrays under set -u
+    es_args+=(${es_settings[@]+"${es_settings[@]}"})
+
+    # The user's own ES_JAVA_OPTS goes last so it wins.
+    local java_opts="${ES_JAVA_OPTS:-}"
+    if (( ${#jvm_options[@]} > 0 )); then
+        java_opts="${jvm_options[*]}${java_opts:+ $java_opts}"
+    fi
+
     if [[ "$verbose" == true ]]; then
-        "$es_bin" \
-            -Ecluster.name="$name" \
-            -Enode.name="$node_name" \
-            -Epath.data="$data_dir" \
-            -Epath.logs="$logs_dir" \
-            -Ehttp.port="$port" \
-            -Ediscovery.type=single-node \
-            -Expack.security.enabled=false \
-            -d
+        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}"
     else
-        "$es_bin" \
-            -Ecluster.name="$name" \
-            -Enode.name="$node_name" \
-            -Epath.data="$data_dir" \
-            -Epath.logs="$logs_dir" \
-            -Ehttp.port="$port" \
-            -Ediscovery.type=single-node \
-            -Expack.security.enabled=false \
-            -d >/dev/null 2>&1
+        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}" >/dev/null 2>&1
     fi
 
     local started=false
@@ -793,6 +946,10 @@ cmd_doctor() {
 cmd_config() {
     echo -e "${BLUE}Config file:${NC} $ESCTL_CONFIG\n"
     load_config | jq '.'
+    if [[ -f "$ESCTL_SETTINGS_FILE" ]]; then
+        echo -e "\n${BLUE}Advanced settings:${NC} $ESCTL_SETTINGS_FILE\n"
+        cat "$ESCTL_SETTINGS_FILE"
+    fi
 }
 
 cmd_logs() {
@@ -1049,6 +1206,9 @@ cmd_setup() {
     echo -e "${BOLD}Summary:${NC}"
     [[ -n "$chosen_es_bin" ]] && echo "  ESCTL_ES_BIN = $chosen_es_bin"
     echo "  ESCTL_CONFIG = $chosen_config"
+    echo
+
+    configure_advanced_settings
     echo
 
     # Offer to import any already-running clusters
