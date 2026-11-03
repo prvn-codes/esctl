@@ -466,22 +466,30 @@ _start_one() {
         java_opts="${jvm_options[*]}${java_opts:+ $java_opts}"
     fi
 
+    # "|| launched=false" stops set -e from exiting before we can report the error.
+    local launched=true
     if [[ "$verbose" == true ]]; then
-        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}"
+        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}" || launched=false
     else
-        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}" >/dev/null 2>&1
+        ES_JAVA_OPTS="$java_opts" "$es_bin" "${es_args[@]}" >/dev/null 2>&1 || launched=false
     fi
 
     local started=false
-    wait_for_http "$port" 60 && started=true
+    if [[ "$launched" == true ]]; then
+        wait_for_http "$port" 60 && started=true
+    fi
 
     if [[ -n "$tail_pid" ]]; then
-        kill "$tail_pid" 2>/dev/null; wait "$tail_pid" 2>/dev/null
+        kill "$tail_pid" 2>/dev/null || true
+        wait "$tail_pid" 2>/dev/null || true
         echo -e "${BLUE}── ─────────────────────────────────────────────────────────────────────${NC}"
     fi
 
     if [[ "$started" == true ]]; then
         success "$name started (port $port)"
+    elif [[ "$launched" == false ]]; then
+        error "$name failed to start — run 'esctl start $name --verbose' to see why"
+        return 1
     else
         error "$name did not respond within 60s — check logs at $logs_dir"
         return 1
