@@ -71,7 +71,7 @@ COMMANDS
   edit    <cluster>    Edit a cluster's configuration
   remove  <cluster>    Remove a cluster
   logs    <cluster>    Tail cluster logs (-f to follow)
-  setup                Configure environment interactively
+  setup                Configure environment and advanced ES settings
   import               Detect and import running clusters
   doctor               Check dependencies and configuration
   config               Show config file path and contents
@@ -147,6 +147,43 @@ Each cluster stores:
 esctl edit myapp
 # → ES binary: /path/to/specific/elasticsearch
 ```
+
+### Advanced ES settings
+
+By default Elasticsearch takes about half your RAM for each cluster. At the end of `esctl setup` you can set this, and a few other local-dev options, once for all clusters:
+
+```
+Configure advanced ES settings? [y/N]: y
+  1) Guided    — answer a few questions
+  2) Edit file — open ~/.esctl/es-settings in your editor
+```
+
+**Guided** asks for:
+
+- heap size (default `1g`)
+- ignoring disk-full checks, so indices don't go read-only when your disk is nearly full
+- turning off machine learning to save memory
+- CORS for browser tools like Elasticvue (off by default)
+
+**Edit file** opens `~/.esctl/es-settings` in `$VISUAL` or `$EDITOR` (falling back to `vi`). Use it to add any other setting:
+
+```
+-Xms1g
+-Xmx1g
+cluster.routing.allocation.disk.threshold_enabled=false
+xpack.ml.enabled=false
+http.cors.enabled=true
+http.cors.allow-origin="*"
+```
+
+- Lines starting with `-` are JVM options, passed via `ES_JAVA_OPTS`. Your own `ES_JAVA_OPTS` still applies and wins.
+- Other lines are ES settings, passed as `-E<key>=<value>`. Values are read as YAML, so quote special ones like `"*"`.
+- If you edit the file by hand and later run guided again, your extra lines are kept.
+- With no file, clusters start with ES defaults.
+
+Changes apply on the next start: `esctl restart`.
+
+> CORS with `*` lets any website open in your browser read your local clusters (security is off). Prefer a specific origin like `http://localhost:8080`.
 
 ### Environment variables
 
